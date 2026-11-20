@@ -989,7 +989,7 @@ class TextStateMachine:
 
         content: str = ""
         reasoning: str = ""
-        tool_calls: tuple[str, ...] = ()
+        tool_calls: tuple[str | dict[str, Any], ...] = ()
 
         def __add__(self, other: "TextStateMachine.Delta") -> "TextStateMachine.Delta":
             return TextStateMachine.Delta(

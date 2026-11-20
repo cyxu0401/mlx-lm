@@ -1611,6 +1611,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Initialize the text state machine
         reader = ctx.text_sm.reader(state=ctx.initial_state)
+        if (
+            request.tools
+            and getattr(self.response_generator.cli_args, "tool_call_parser", None)
+            == "minicpm5"
+        ):
+            from .tool_parsers.minicpm5_xml4 import XML4Reader
+
+            reader = XML4Reader(ctx.initial_state, request.tools)
+            tool_formatter = ToolCallFormatter(
+                lambda call, _: call, request.tools, self.stream
+            )
 
         # Variables to save the generated text, tokens, logprobs, tools etc
         finish_reason = "stop"
@@ -2003,6 +2014,11 @@ def main():
         type=int,
         default=512,
         help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=["minicpm5"],
+        help="Use the MiniCPM5 XML4 tool parser.",
     )
     parser.add_argument(
         "--chat-template-args",

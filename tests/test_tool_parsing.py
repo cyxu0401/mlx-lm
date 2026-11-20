@@ -11,6 +11,7 @@ from mlx_lm.tool_parsers import (
     kimi_k3,
     longcat,
     minicpm5,
+    minicpm5_xml4,
     minimax_m2,
     mistral,
     muse_spark,
@@ -701,6 +702,38 @@ class TestToolParsing(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             minicpm5.parse_tool_call("no call here", tools)
+
+    def test_minicpm5_xml4_streaming(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            },
+        ]
+        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        self.assertEqual(parser.feed("before <func"), ("before ", []))
+        self.assertEqual(
+            parser.feed('tion name="f"><param name="city"><![CDATA[a</function>'),
+            ("", []),
+        )
+        self.assertEqual(
+            parser.feed(
+                'b]]></param><param name="city">ignored</param>'
+                '<param name="extra">1</param></function>'
+                '<function name="f"></function> after',
+                final=True,
+            ),
+            (
+                " after",
+                [{"name": "f", "arguments": {"city": "a</function>b"}}],
+            ),
+        )
 
     def test_minimax_m2(self):
         test_case = (
