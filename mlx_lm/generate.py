@@ -37,12 +37,10 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .models.minicpm5_moe import dspark
 from .processors import load_processor
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
-    _download,
     does_model_support_input_embeddings,
     load,
     maybe_set_recommended_wired_limit,
@@ -235,9 +233,7 @@ def setup_arg_parser():
         help="A model to be used for speculative decoding.",
         default=None,
     )
-    parser.add_argument(
-        "--speculative-algorithm", choices=["DSPARK"], help="Use a DSpark draft."
-    )
+    parser.add_argument("--speculative-algorithm", choices=["DSPARK"])
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
@@ -688,8 +684,6 @@ def stream_generate(
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
-    *,
-    dspark_stats: Optional[dspark.DraftStats] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -705,7 +699,6 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
-        dspark_stats: Optional counters for a DSpark draft.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -734,33 +727,18 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if isinstance(draft_model, dspark.Draft):
-        unsupported = [
-            key
-            for key in ("prompt_cache", "input_embeddings", "kv_bits", "max_kv_size")
-            if kwargs.pop(key, None) is not None
-        ]
-        if kwargs.pop("logits_processors", None):
-            unsupported.append("logits_processors")
-        if unsupported:
-            raise ValueError(f"DSpark does not support {', '.join(unsupported)}.")
-        for key in ("num_draft_tokens", "kv_group_size", "quantized_kv_start"):
-            kwargs.pop(key, None)
-        token_generator = dspark.generate_step(
-            prompt,
-            model,
-            draft_model,
-            stream,
-            stats=dspark_stats,
-            eos_token_ids=tokenizer.eos_token_ids,
-            **kwargs,
-        )
-    elif draft_model is None:
+    if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
+        )
+    elif (
+        draft_step := getattr(draft_model, "speculative_generate_step", None)
+    ) is not None:
+        token_generator = draft_step(
+            prompt, model, stream, eos_token_ids=tokenizer.eos_token_ids, **kwargs
         )
     else:
         kwargs.pop("max_kv_size", None)
@@ -2115,12 +2093,15 @@ def batch_generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
-
     use_dspark = args.speculative_algorithm == "DSPARK"
-    if use_dspark and args.draft_model is None:
-        parser.error("DSPARK requires --speculative-draft-model-path.")
-    if use_dspark and (args.min_p or args.xtc_probability):
-        parser.error("DSPARK supports temperature, top-k and top-p sampling.")
+    if use_dspark:
+        from .models.minicpm5_moe import dspark
+        from .utils import _download
+
+        if args.draft_model is None:
+            parser.error("DSPARK requires --speculative-draft-model-path.")
+        if args.min_p or args.xtc_probability:
+            parser.error("DSPARK supports temperature, top-k and top-p sampling.")
 
     if args.seed is not None:
         mx.random.seed(args.seed)
@@ -2235,19 +2216,18 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
+    sampler = make_sampler(
+        args.temp,
+        args.top_p,
+        args.min_p,
+        args.min_tokens_to_keep,
+        top_k=args.top_k,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+    )
     if use_dspark:
         sampler = dspark.Sampling(args.temp, args.top_k, args.top_p or 1.0)
-    else:
-        sampler = make_sampler(
-            args.temp,
-            args.top_p,
-            args.min_p,
-            args.min_tokens_to_keep,
-            top_k=args.top_k,
-            xtc_probability=args.xtc_probability,
-            xtc_threshold=args.xtc_threshold,
-            xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
-        )
     response = generate(
         model,
         tokenizer,

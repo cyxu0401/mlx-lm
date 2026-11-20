@@ -48,8 +48,6 @@ python -m mlx_lm server \
   --model-path /path/to/mlx-checkpoint \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path /path/to/dspark-checkpoint \
-  --tool-call-parser minicpm5 \
-  --chat-template-args '{"has_tool_sep": false}' \
   --prefill-step-size 128 \
   --allocator-cache-limit 268435456
 ```
@@ -60,10 +58,6 @@ target and draft K/V caches and uses the proposal block size in the draft
 config. DSpark handles requests sequentially and supports greedy decoding,
 temperature, top-k and top-p. The server logs the number of proposed and
 accepted draft tokens per request.
-
-The `minicpm5` parser applies XML4 parameter rules and emits complete calls in
-both JSON and SSE. Send the returned assistant `tool_calls` and corresponding
-`role: tool` messages in the next request to continue the conversation.
 
 ### KV Cache Quantization
 

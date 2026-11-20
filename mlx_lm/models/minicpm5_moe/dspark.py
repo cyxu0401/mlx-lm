@@ -3,8 +3,11 @@
 """Single-request DSpark generation with a Qwen3 GQA draft."""
 
 import json
+import logging
 import math
-from dataclasses import dataclass
+import time
+from contextlib import closing
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -134,6 +137,48 @@ class Draft(nn.Module):
                 distributions.append(log_q)
             proposals.append(previous)
         return mx.stack(proposals), distributions
+
+    @staticmethod
+    def speculative_sampler(sampling):
+        return Sampling(sampling.temperature, sampling.top_k, sampling.top_p or 1.0)
+
+    def speculative_generate_step(
+        self, prompt, target, stream, *, dspark_stats=None, **kwargs
+    ):
+        unsupported = [
+            key
+            for key in ("input_embeddings", "kv_bits", "max_kv_size")
+            if kwargs.pop(key, None) is not None
+        ]
+        if kwargs.pop("logits_processors", None):
+            unsupported.append("logits_processors")
+        if unsupported:
+            raise ValueError(f"DSpark does not support {', '.join(unsupported)}.")
+        for key in ("num_draft_tokens", "kv_group_size", "quantized_kv_start"):
+            kwargs.pop(key, None)
+        stats = dspark_stats if dspark_stats is not None else DraftStats()
+        steps = generate_step(prompt, target, self, stream, stats=stats, **kwargs)
+        count = emitted = 0
+        start = time.perf_counter()
+        try:
+            with closing(steps):
+                for record in steps:
+                    count += 1
+                    emitted += record[2]
+                    yield record
+        finally:
+            logging.info(
+                "DSpark %s",
+                json.dumps(
+                    dict(
+                        asdict(stats),
+                        emitted_draft=emitted,
+                        prompt_tokens=prompt.size,
+                        completion_tokens=count,
+                        elapsed_seconds=round(time.perf_counter() - start, 3),
+                    )
+                ),
+            )
 
 
 def load_draft(path: Path, target):
@@ -266,6 +311,7 @@ def generate_step(
     sampler=None,
     stats=None,
     eos_token_ids=(),
+    prompt_cache=None,
     prefill_step_size=128,
     prompt_progress_callback=None,
 ):
@@ -284,8 +330,16 @@ def generate_step(
         raise ValueError(
             "Expected a nonempty 1-D prompt and positive token/step limits."
         )
-    target_cache = make_prompt_cache(target)
-    draft_cache = [KVCache() for _ in draft.layers]
+    if prompt_cache is None:
+        target_cache = make_prompt_cache(target)
+        draft_cache = [KVCache() for _ in draft.layers]
+    else:
+        if len(prompt_cache) != len(target.layers) + len(draft.layers) or any(
+            cache.offset for cache in prompt_cache
+        ):
+            raise ValueError("DSpark requires an empty target and draft KV cache.")
+        target_cache = prompt_cache[: len(target.layers)]
+        draft_cache = prompt_cache[len(target.layers) :]
     capture = draft.args.target_layer_ids
 
     with mx.stream(stream):

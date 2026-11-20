@@ -1000,46 +1000,12 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    def test_minicpm5_moe(self):
-        from mlx_lm.models import minicpm5_moe
+    @staticmethod
+    def _minicpm5_target():
+        from mlx_lm.models.minicpm5_moe import Model, ModelArgs
 
-        args = minicpm5_moe.ModelArgs(
-            model_type="minicpm5_moe",
-            hidden_size=128,
-            intermediate_size=256,
-            moe_intermediate_size=128,
-            vocab_size=64,
-            num_hidden_layers=3,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=64,
-            n_routed_experts=4,
-            n_shared_experts=1,
-            num_experts_per_tok=2,
-            first_k_dense_replace=1,
-            use_gated_attention=True,
-        )
-        model = minicpm5_moe.Model(args)
-        self.assertEqual(model.model_type, "minicpm5_moe")
-        self.assertEqual(len(model.layers), args.num_hidden_layers)
-        inputs = mx.array([[0, 1], [2, 3]])
-        for dtype in (mx.float32, mx.float16):
-            model.set_dtype(dtype)
-            cache = make_prompt_cache(model)
-            logits = model(inputs, cache=cache)
-            self.assertEqual(logits.shape, (2, 2, args.vocab_size))
-            self.assertEqual(logits.dtype, mx.float32)
-            next_logits = model(inputs[:, :1], cache=cache)
-            self.assertEqual(next_logits.shape, (2, 1, args.vocab_size))
-            mx.eval(logits, next_logits)
-
-    def test_minicpm5_dspark_matches_greedy(self):
-        from mlx_lm.generate import generate_step, generation_stream
-        from mlx_lm.models import minicpm5_moe
-        from mlx_lm.models.minicpm5_moe import dspark
-
-        target = minicpm5_moe.Model(
-            minicpm5_moe.ModelArgs(
+        return Model(
+            ModelArgs(
                 model_type="minicpm5_moe",
                 hidden_size=64,
                 intermediate_size=128,
@@ -1056,6 +1022,26 @@ class TestModels(unittest.TestCase):
                 use_gated_attention=True,
             )
         )
+
+    def test_minicpm5_moe(self):
+        model = self._minicpm5_target()
+        self.assertEqual(model.model_type, "minicpm5_moe")
+        inputs = mx.array([[0, 1], [2, 3]])
+        for dtype in (mx.float32, mx.float16):
+            model.set_dtype(dtype)
+            cache = make_prompt_cache(model)
+            logits = model(inputs, cache=cache)
+            self.assertEqual(logits.shape, (2, 2, model.args.vocab_size))
+            self.assertEqual(logits.dtype, mx.float32)
+            next_logits = model(inputs[:, :1], cache=cache)
+            self.assertEqual(next_logits.shape, (2, 1, model.args.vocab_size))
+            mx.eval(logits, next_logits)
+
+    def test_minicpm5_dspark_matches_greedy(self):
+        from mlx_lm.generate import generate_step, generation_stream
+        from mlx_lm.models.minicpm5_moe import dspark
+
+        target = self._minicpm5_target()
         draft = dspark.Draft(
             dspark.DraftArgs(
                 hidden_size=64,
@@ -1074,23 +1060,23 @@ class TestModels(unittest.TestCase):
             )
         )
         prompt = mx.arange(19) % 32
-        stats = dspark.DraftStats()
         expected = [
             token
             for token, _ in generate_step(
                 prompt, target, max_tokens=11, prefill_step_size=8
             )
         ]
+        stats = dspark.DraftStats()
         actual = [
             token
-            for token, _, _ in dspark.generate_step(
+            for token, _, _ in draft.speculative_generate_step(
                 prompt,
                 target,
-                draft,
                 generation_stream,
                 max_tokens=11,
                 prefill_step_size=8,
-                stats=stats,
+                dspark_stats=stats,
+                prompt_cache=make_prompt_cache(target) + make_prompt_cache(draft),
             )
         ]
         self.assertEqual(actual, expected)
