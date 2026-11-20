@@ -459,6 +459,17 @@ def load_model(
     if model_config is not None:
         config.update(model_config)
 
+    if (
+        config.get("model_type") == "minicpm5_moe"
+        and "quantization" not in config
+        and (config.get("quantization_config") or {}).get("format") == "pack-quantized"
+    ):
+        raise ValueError(
+            "Convert the MiniCPM5 compressed-tensors checkpoint with "
+            "python -m mlx_lm.quant.minicpm5 SOURCE DESTINATION "
+            "and load DESTINATION."
+        )
+
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:

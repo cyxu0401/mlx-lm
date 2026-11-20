@@ -45,9 +45,12 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.minicpm5_moe import dspark
 from .processors import load_processor
 from .sample_utils import make_logits_processors, make_sampler
+from .tool_parsers.minicpm5 import MiniCPM5ToolParser
 from .utils import (
+    _download,
     _parse_size,
     load,
     maybe_set_recommended_wired_limit,
@@ -90,6 +93,14 @@ class ToolCallFormatter:
             "id": tc_id,
         }
 
+    def format_calls(self, calls):
+        formatted = [self._format(call) for call in calls]
+        for call in formatted:
+            if self._streaming:
+                call["index"] = self.count
+            self.count += 1
+        return formatted
+
     def __call__(self, tool_calls):
         if not tool_calls:
             return []
@@ -101,18 +112,13 @@ class ToolCallFormatter:
                 parsed = self._tool_parser(tool_text, self._tools)
                 if not isinstance(parsed, list):
                     parsed = [parsed]
-                formatted = [self._format(tc) for tc in parsed]
+                result.extend(self.format_calls(parsed))
             except Exception as e:
                 logging.warning(
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
                     f"tool text was likely truncated mid-generation."
                 )
                 continue
-            for out in formatted:
-                if self._streaming:
-                    out["index"] = self.count
-                self.count += 1
-                result.append(out)
         return result
 
 
@@ -464,12 +470,15 @@ class ModelProvider:
         # Load the draft model for speculative decoding
         draft_model = None
         if draft_model_path is not None:
-            draft_model, draft_tokenizer = load(draft_model_path)
-            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
-                logging.warning(
-                    "Draft model tokenizer does not match model tokenizer. "
-                    "Speculative decoding may not work as expected."
-                )
+            if getattr(self.cli_args, "speculative_algorithm", None) == "DSPARK":
+                draft_model = dspark.load_draft(_download(draft_model_path), model)
+            else:
+                draft_model, draft_tokenizer = load(draft_model_path)
+                if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                    logging.warning(
+                        "Draft model tokenizer does not match model tokenizer. "
+                        "Speculative decoding may not work as expected."
+                    )
 
         # Compute batchability
         is_batchable = draft_model is None
@@ -764,6 +773,18 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state, None
 
+    def _text_state_machine(self, tokenizer, request):
+        if (
+            request.tools
+            and getattr(self.cli_args, "tool_call_parser", None) == "minicpm5"
+        ):
+            # The chat template sets the initial reasoning state.
+            transitions = {}
+            if tokenizer.has_thinking:
+                transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+            return TextStateMachine(transitions)
+        return TextStateMachine.from_tokenizer(tokenizer)
+
     def _is_batchable(self, args):
         return (
             self.model_provider.is_batchable
@@ -833,7 +854,7 @@ class ResponseGenerator:
                         continue
 
                     stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
+                    text_sm = self._text_state_machine(current_tokenizer, request)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -1054,13 +1075,15 @@ class ResponseGenerator:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
+            use_dspark = isinstance(draft_model, dspark.Draft)
+            stats = dspark.DraftStats() if use_dspark else None
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state, vision = self._tokenize(
                 tokenizer, request, args
             )
             stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-            text_sm = TextStateMachine.from_tokenizer(tokenizer)
+            text_sm = self._text_state_machine(tokenizer, request)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -1078,21 +1101,32 @@ class ResponseGenerator:
                 mx.random.seed(args.seed)
 
             # Make the sampler and logit processor
-            sampler = _make_sampler(args, tokenizer)
+            if use_dspark:
+                sampling = args.sampling
+                sampler = dspark.Sampling(
+                    sampling.temperature, sampling.top_k, sampling.top_p or 1.0
+                )
+            else:
+                sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
-            self._log_cache_stats()
             cache_key = vision.cache_key if vision is not None else prompt[:]
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, cache_key
-            )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
-            rest = prompt[ctx.prompt_cache_count :]
-            if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+            if use_dspark:
+                # The draft context requires residuals from the full prompt.
+                cache, rest = None, prompt
+                ctx.prompt_cache_count = 0
+            else:
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, cache_key
+                )
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+                rest = prompt[ctx.prompt_cache_count :]
+                if cache is None:
+                    cache = make_prompt_cache(model)
+                    if draft_model is not None:
+                        cache += make_prompt_cache(draft_model)
 
             # The images after the cached tokens.
             input_embeddings = None
@@ -1107,6 +1141,8 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_reader = stop_sm.reader()
+            emitted_draft = 0
+            start = time.perf_counter()
             for gen in stream_generate(
                 model=model,
                 stream=stream,
@@ -1117,6 +1153,7 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
+                dspark_stats=stats,
                 num_draft_tokens=args.num_draft_tokens,
                 input_embeddings=input_embeddings,
                 prompt_progress_callback=progress,
@@ -1129,11 +1166,16 @@ class ResponseGenerator:
                     stop_reader, gen.text, finish_reason=gen.finish_reason
                 )
 
+                logprob = (
+                    gen.logprobs[gen.token].item()
+                    if not use_dspark or args.logprobs
+                    else 0.0
+                )
                 rqueue.put(
                     Response(
                         text,
                         gen.token,
-                        gen.logprobs[gen.token].item(),
+                        logprob,
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
@@ -1141,6 +1183,8 @@ class ResponseGenerator:
                     )
                 )
                 cache_key.append(gen.token)
+                if stats is not None:
+                    emitted_draft += gen.from_draft
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -1150,12 +1194,26 @@ class ResponseGenerator:
                 if finish_reason is not None:
                     break
 
+            if stats is not None:
+                logging.info(
+                    "DSpark %s",
+                    json.dumps(
+                        {
+                            "steps": stats.steps,
+                            "proposed": stats.proposed,
+                            "accepted": stats.accepted,
+                            "emitted_draft": emitted_draft,
+                            "prompt_tokens": len(prompt),
+                            "completion_tokens": len(cache_key) - len(prompt),
+                            "elapsed_seconds": round(time.perf_counter() - start, 3),
+                        }
+                    ),
+                )
             rqueue.put(None)
-
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            if not use_dspark:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -1423,6 +1481,22 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("stop must be a list of strings")
 
+        if (
+            getattr(self.response_generator.cli_args, "speculative_algorithm", None)
+            == "DSPARK"
+            and self.requested_draft_model is not None
+        ):
+            unsupported = (
+                "min_p",
+                "xtc_probability",
+                "logit_bias",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+            )
+            if names := [name for name in unsupported if getattr(self, name)]:
+                raise ValueError(f"DSpark does not support {', '.join(names)}.")
+
     def generate_response(
         self,
         text: str,
@@ -1608,6 +1682,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
+        xml4 = None
+        if (
+            request.tools
+            and getattr(self.response_generator.cli_args, "tool_call_parser", None)
+            == "minicpm5"
+        ):
+            xml4 = MiniCPM5ToolParser(request.tools)
 
         # Initialize the text state machine
         reader = ctx.text_sm.reader(state=ctx.initial_state)
@@ -1615,6 +1696,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Variables to save the generated text, tokens, logprobs, tools etc
         finish_reason = "stop"
         pending = TextStateMachine.Delta()
+        parsed_calls = []
         tokens = []
         token_logprobs = []
         top_tokens = []
@@ -1629,6 +1711,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     delta = reader.finish(gen.text)
 
+                if xml4 is not None:
+                    content, calls = xml4.feed(
+                        delta.content, final=gen.finish_reason is not None
+                    )
+                    delta = TextStateMachine.Delta(content, delta.reasoning)
+                    parsed_calls.extend(tool_formatter.format_calls(calls))
                 pending += delta
 
                 # Add the tokens and logprobs to the vars.
@@ -1639,7 +1727,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens.append(gen.top_tokens)
 
                 if self.stream:
-                    tool_calls = tool_formatter(pending.tool_calls)
+                    tool_calls = parsed_calls + tool_formatter(pending.tool_calls)
                     if pending.content or pending.reasoning or tool_calls:
                         resp = self.generate_response(
                             pending.content,
@@ -1650,12 +1738,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                         self.wfile.flush()
                     pending = TextStateMachine.Delta()
+                    parsed_calls = []
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
             # Only tool calls that parse count for the finish reason.
-            tool_calls = tool_formatter(pending.tool_calls)
+            tool_calls = parsed_calls + tool_formatter(pending.tool_calls)
             if finish_reason == "stop" and tool_formatter.count:
                 finish_reason = "tool_calls"
 
@@ -1912,6 +2001,7 @@ def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
+        "--model-path",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
     )
@@ -1940,9 +2030,18 @@ def main():
     )
     parser.add_argument(
         "--draft-model",
+        "--speculative-draft-model-path",
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
+    )
+    parser.add_argument(
+        "--speculative-algorithm", choices=["DSPARK"], help="Use a DSpark draft."
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=["minicpm5"],
+        help="Use the MiniCPM5 XML4 tool parser.",
     )
     parser.add_argument(
         "--num-draft-tokens",
@@ -2040,6 +2139,11 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--allocator-cache-limit",
+        type=_parse_size,
+        help="Maximum size in bytes of reusable MLX allocator buffers.",
+    )
+    parser.add_argument(
         "--kv-bits",
         type=int,
         default=None,
@@ -2066,7 +2170,14 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.speculative_algorithm == "DSPARK":
+        if args.draft_model is None:
+            parser.error("DSPARK requires --speculative-draft-model-path.")
+        if args.kv_bits is not None:
+            parser.error("DSPARK uses full-precision KV caches.")
     _ = maybe_set_recommended_wired_limit()
+    if args.allocator_cache_limit is not None:
+        mx.set_cache_limit(args.allocator_cache_limit)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
