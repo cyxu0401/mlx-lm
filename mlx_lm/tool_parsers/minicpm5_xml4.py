@@ -35,14 +35,13 @@ def _schema_properties(schema):
     return properties
 
 
-def _function_end(text, start, final):
+def _function_end(text, start):
     while boundary := _FUNCTION_BOUNDARY.search(text, start):
         if boundary.group() == _END:
             return boundary.start()
         end = text.find(_CDATA_END, boundary.end())
         if end == -1:
-            # Resolve broken CDATA at end of generation, after all chunks arrive.
-            return text.find(_END, boundary.end()) if final else -1
+            return text.find(_END, boundary.end())
         start = end + len(_CDATA_END)
     return -1
 
@@ -98,7 +97,7 @@ def _parse_arguments(body, properties):
 
 
 class MiniCPM5ToolParser:
-    """Parse XML4 after reasoning separation, emitting each complete call once."""
+    """Parse XML4 using the full-response and incremental detector rules."""
 
     def __init__(self, tools):
         self._schemas = {}
@@ -112,66 +111,66 @@ class MiniCPM5ToolParser:
                     set(schema.get("required") or ()),
                 )
         self._pending = ""
-        self._text_only = False
+        self._saw_call = False
 
-    def feed(self, text, *, final=False):
-        if self._text_only:
-            return text, []
-        self._pending += text
+    def parse(self, text):
         normal = []
         calls = []
-        while self._pending:
-            start = self._pending.find(_START)
-            if start == -1:
-                # Retain a partial opening marker across stream chunks.
-                end = len(self._pending)
-                if not final:
-                    for length in range(len(_START) - 1, 0, -1):
-                        if self._pending.endswith(_START[:length]):
-                            end -= length
-                            break
-                normal.append(self._pending[:end])
-                self._pending = self._pending[end:]
-                break
-
-            normal.append(self._pending[:start])
-            self._pending = self._pending[start:]
-            opening = _FUNCTION.match(self._pending)
+        pos = 0
+        while (start := text.find(_START, pos)) != -1:
+            opening = _FUNCTION.match(text, start)
             if opening is None:
-                if ">" in self._pending:
-                    self._text_only = True
-                    final = True
                 break
-            close = _function_end(self._pending, opening.end(), final)
+            close = _function_end(text, opening.end())
             if close == -1:
                 break
 
+            normal.append(text[pos:start])
             end = close + len(_END)
             name = opening[1].strip()
             if name not in self._schemas:
-                normal.append(self._pending[:end])
+                normal.append(text[start:end])
             else:
                 properties, required = self._schemas[name]
-                arguments = _parse_arguments(
-                    self._pending[opening.end() : close], properties
-                )
+                arguments = _parse_arguments(text[opening.end() : close], properties)
                 if required.issubset(arguments):
                     try:
                         json.dumps(arguments)
                     except TypeError:
-                        normal.append(self._pending[:end])
-                    else:
-                        calls.append({"name": name, "arguments": arguments})
-            self._pending = self._pending[end:]
+                        return text, []
+                    calls.append({"name": name, "arguments": arguments})
+            pos = end
 
-        if final:
-            normal.append(self._pending)
-            self._pending = ""
+        normal.append(text[pos:])
         return "".join(normal), calls
+
+    def feed(self, text):
+        """Consume one complete block per chunk and keep the tail for the next chunk."""
+        self._pending += text
+        start = self._pending.find(_START)
+        if start == -1:
+            if any(self._pending.endswith(_START[:i]) for i in range(1, len(_START))):
+                return "", []
+            content = "" if self._saw_call else self._pending
+            self._pending = ""
+            return content, []
+
+        close = _function_end(self._pending, start)
+        if close == -1:
+            content = self._pending[:start]
+            self._pending = self._pending[start:]
+            return content, []
+
+        end = close + len(_END)
+        content, calls = self.parse(self._pending[:end])
+        self._pending = self._pending[end:]
+        if calls:
+            self._saw_call = True
+        return content, calls
 
 
 class XML4Reader:
-    def __init__(self, initial_state, tools):
+    def __init__(self, initial_state, tools, *, streaming):
         from ..generate import TextStateMachine
 
         # The MiniCPM5 chat template determines the initial reasoning state.
@@ -179,9 +178,17 @@ class XML4Reader:
             state=initial_state
         )
         self._parser = MiniCPM5ToolParser(tools)
+        self._streaming = streaming
+        self._content = []
 
     def _parse(self, delta, *, final=False):
-        content, calls = self._parser.feed(delta.content, final=final)
+        if self._streaming:
+            content, calls = self._parser.feed(delta.content)
+        else:
+            self._content.append(delta.content)
+            if not final:
+                return replace(delta, content="")
+            content, calls = self._parser.parse("".join(self._content))
         return replace(delta, content=content, tool_calls=tuple(calls))
 
     def feed(self, text):

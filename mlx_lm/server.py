@@ -1618,7 +1618,7 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             from .tool_parsers.minicpm5_xml4 import XML4Reader
 
-            reader = XML4Reader(ctx.initial_state, request.tools)
+            reader = XML4Reader(ctx.initial_state, request.tools, streaming=self.stream)
             tool_formatter = ToolCallFormatter(
                 lambda call, _: call, request.tools, self.stream
             )

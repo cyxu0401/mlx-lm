@@ -703,7 +703,7 @@ class TestToolParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             minicpm5.parse_tool_call("no call here", tools)
 
-    def test_minicpm5_xml4_streaming(self):
+    def test_minicpm5_xml4_response_modes(self):
         tools = [
             {
                 "type": "function",
@@ -717,23 +717,23 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
-        self.assertEqual(parser.feed("before <func"), ("before ", []))
-        self.assertEqual(
-            parser.feed('tion name="f"><param name="city"><![CDATA[a</function>'),
-            ("", []),
+        call = '<function name="f"><param name="city">Paris</param></function>'
+        opening = '<function name="f"><param name="city"><![CDATA['
+        cdata = (
+            'a</function>b]]></param><param name="city">ignored</param>'
+            '<param name="extra">1</param></function>'
         )
+        cdata_call = {"name": "f", "arguments": {"city": "a</function>b"}}
+        paris = {"name": "f", "arguments": {"city": "Paris"}}
         self.assertEqual(
-            parser.feed(
-                'b]]></param><param name="city">ignored</param>'
-                '<param name="extra">1</param></function>'
-                '<function name="f"></function> after',
-                final=True,
-            ),
-            (
-                " after",
-                [{"name": "f", "arguments": {"city": "a</function>b"}}],
-            ),
+            parser.parse("before " + opening + cdata + call + " after"),
+            ("before  after", [cdata_call, paris]),
         )
+        self.assertEqual(parser.feed("before <func"), ("", []))
+        self.assertEqual(parser.feed(opening[len("<func") :]), ("before ", []))
+        self.assertEqual(parser.feed(cdata + call), ("", [cdata_call]))
+        self.assertEqual(parser.feed(""), ("", [paris]))
+        self.assertEqual(parser.feed(" after"), ("", []))
 
     def test_minimax_m2(self):
         test_case = (
