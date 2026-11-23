@@ -1,7 +1,9 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from types import SimpleNamespace
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
@@ -729,11 +731,123 @@ class TestToolParsing(unittest.TestCase):
             parser.parse("before " + opening + cdata + call + " after"),
             ("before  after", [cdata_call, paris]),
         )
-        self.assertEqual(parser.feed("before <func"), ("", []))
-        self.assertEqual(parser.feed(opening[len("<func") :]), ("before ", []))
-        self.assertEqual(parser.feed(cdata + call), ("", [cdata_call]))
-        self.assertEqual(parser.feed(""), ("", [paris]))
-        self.assertEqual(parser.feed(" after"), ("", []))
+        self.assertEqual(parser.feed("before <func"), ("before ", []))
+        self.assertEqual(
+            parser.feed(opening[len("<func") :] + "a</function>"), ("", [])
+        )
+        self.assertEqual(
+            parser.finish(cdata[len("a</function>") :] + call + " after"),
+            (" after", [cdata_call, paris]),
+        )
+        self.assertEqual(parser.feed(call + call), ("", [paris, paris]))
+        self.assertEqual(parser.feed(" between "), (" between ", []))
+        self.assertEqual(parser.finish(call + " tail"), (" tail", [paris]))
+
+    def test_minicpm5_xml4_literal_and_incomplete_markup(self):
+        tools = [{"function": {"name": "f"}}]
+        call = '<function name="f"></function>'
+        expected = [{"name": "f", "arguments": {}}]
+        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        self.assertEqual(
+            parser.parse("use <function> then " + call),
+            ("use <function> then ", expected),
+        )
+        self.assertEqual(
+            parser.feed("use <function> then "), ("use <function> then ", [])
+        )
+        self.assertEqual(parser.feed(call + "Hello <func"), ("Hello ", expected))
+        self.assertEqual(parser.finish(), ("<func", []))
+        unfinished = '<function name="f">some unclosed text'
+        self.assertEqual(parser.feed(unfinished), ("", []))
+        self.assertEqual(parser.finish(), (unfinished, []))
+
+    def test_minicpm5_xml4_cdata_and_composed_types(self):
+        tools = [
+            {
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "properties": {
+                            "city": {"type": "string"},
+                            "n": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                        },
+                    },
+                }
+            }
+        ]
+        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        for raw, value in (("5", 5), ("null", None)):
+            with self.subTest(raw=raw):
+                text = (
+                    '<function name="f"><param name="city"> <![CDATA[ Paris ]]>'
+                    f'\n</param><param name="n">{raw}</param></function>'
+                )
+                self.assertEqual(
+                    parser.parse(text),
+                    ("", [{"name": "f", "arguments": {"city": " Paris ", "n": value}}]),
+                )
+
+    def test_minicpm5_xml4_invalid_arguments_do_not_discard_other_calls(self):
+        tools = [
+            {
+                "function": {
+                    "name": "f",
+                    "parameters": {"properties": {"items": {"type": "array"}}},
+                },
+            }
+        ]
+        good = '<function name="f"></function>'
+        bad = '<function name="f"><param name="items">{1, 2}</param></function>'
+        valid = {"name": "f", "arguments": {}}
+        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        self.assertEqual(parser.parse(good + bad + good), (bad, [valid, valid]))
+        self.assertEqual(parser.finish(good + bad + good), (bad, [valid, valid]))
+        for empty_tools in (None, []):
+            with self.subTest(tools=empty_tools):
+                parser = minicpm5_xml4.MiniCPM5ToolParser(empty_tools)
+                self.assertEqual(parser.feed(good), (good, []))
+
+    def test_minicpm5_xml4_reader_preserves_tokenizer_markers(self):
+        tokenizer = SimpleNamespace(
+            has_thinking=True,
+            think_start="<analysis>",
+            think_end="</analysis>",
+            has_tool_calling=True,
+            tool_call_start="<function name=",
+            tool_call_end="</function>",
+            structural_markers=("<separator>",),
+            response_transitions={"normal": [("<extra_analysis>", "reasoning")]},
+        )
+        machine = TextStateMachine.from_tokenizer(tokenizer, include_tool_calls=False)
+        tools = [{"function": {"name": "f"}}]
+        example = '<function name="f"><param name="city">Paris</param></function>'
+        real = (
+            '<function name="f"><param name="city">'
+            "<![CDATA[<analysis><separator>Tokyo</analysis>]]></param></function>"
+        )
+        output = (
+            "<separator><analysis>example " + example + "</analysis>"
+            "<extra_analysis>another thought</analysis>Answer<"
+            + real
+            + "analysis> tail"
+        )
+        expected = TextStateMachine.Delta(
+            content="Answer<analysis> tail",
+            reasoning="example " + example + "another thought",
+            tool_calls=(
+                {
+                    "name": "f",
+                    "arguments": {"city": "<analysis><separator>Tokyo</analysis>"},
+                },
+            ),
+        )
+        reader = minicpm5_xml4.XML4Reader(machine.reader(), tools)
+        self.assertEqual(reader.finish(output), expected)
+        reader = minicpm5_xml4.XML4Reader(machine.reader(), tools)
+        delta = TextStateMachine.Delta()
+        for character in output:
+            delta += reader.feed(character)
+        self.assertEqual(delta + reader.finish(), expected)
 
     def test_minimax_m2(self):
         test_case = (

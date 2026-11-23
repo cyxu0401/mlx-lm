@@ -1010,6 +1010,10 @@ class TextStateMachine:
             self._enter(state)
 
         @property
+        def state(self) -> TextState:
+            return self._state
+
+        @property
         def stopped(self) -> bool:
             return self._state == "stop"
 
@@ -1106,7 +1110,9 @@ class TextStateMachine:
         return cls({"normal": [(w, "stop") for w in stop_words]})
 
     @classmethod
-    def from_tokenizer(cls, tokenizer: TokenizerWrapper) -> "TextStateMachine":
+    def from_tokenizer(
+        cls, tokenizer: TokenizerWrapper, *, include_tool_calls: bool = True
+    ) -> "TextStateMachine":
         """A TextStateMachine with the markers of a tokenizer."""
         transitions = {}
 
@@ -1116,7 +1122,7 @@ class TextStateMachine:
             )
             transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
-        if tokenizer.has_tool_calling:
+        if include_tool_calls and tokenizer.has_tool_calling:
             # A response format that goes to "tool" decides where calls start.
             targets = set()
             for edges in tokenizer.response_transitions.values():
@@ -1137,6 +1143,10 @@ class TextStateMachine:
                 transitions.setdefault("normal", []).append((w, "normal"))
 
         for state, edges in tokenizer.response_transitions.items():
+            if not include_tool_calls:
+                if state == "tool":
+                    continue
+                edges = [(marker, dst) for marker, dst in edges if dst != "tool"]
             transitions.setdefault(state, []).extend(edges)
 
         return cls(transitions)

@@ -4,15 +4,18 @@
 
 import ast
 import json
-import re
-from dataclasses import replace
+
+import regex as re
+
+from .minimax_m2 import _convert_param_value_with_types, _extract_types_from_schema
 
 _START = "<function"
+_START_PREFIXES = tuple(_START[:i] for i in range(len(_START) - 1, 0, -1))
 _END = "</function>"
 _CDATA = "<![CDATA["
 _CDATA_END = "]]>"
 _PARAM_END = "</param>"
-_FUNCTION = re.compile(r"""<function\s+name=['"]([^'"]+)['"][^>]*>""")
+_FUNCTION = re.compile(r"""<function\s+name\s*=\s*(['"])([^'"<>]+)\1[^<>]*>""")
 _PARAM = re.compile(r"""<param\s+name=['"]([^'"]+)['"][^>]*>""")
 _FUNCTION_BOUNDARY = re.compile(r"</function>|<!\[CDATA\[")
 _PARAM_BOUNDARY = re.compile(r"</param>|<param")
@@ -35,23 +38,25 @@ def _schema_properties(schema):
     return properties
 
 
-def _function_end(text, start):
+def _function_end(text, start, *, final):
     while boundary := _FUNCTION_BOUNDARY.search(text, start):
         if boundary.group() == _END:
             return boundary.start()
         end = text.find(_CDATA_END, boundary.end())
         if end == -1:
-            return text.find(_END, boundary.end())
+            # Recover a missing CDATA terminator only after generation ends.
+            return text.find(_END, boundary.end()) if final else -1
         start = end + len(_CDATA_END)
     return -1
 
 
 def _param_value(body, start):
-    if body.startswith(_CDATA, start):
-        start += len(_CDATA)
+    cdata_start = _WHITESPACE.match(body, start).end()
+    if body.startswith(_CDATA, cdata_start):
+        start = cdata_start + len(_CDATA)
         end = body.find(_CDATA_END, start)
         if end != -1:
-            stop = end + len(_CDATA_END)
+            stop = _WHITESPACE.match(body, end + len(_CDATA_END)).end()
             if body.startswith(_PARAM_END, stop):
                 stop += len(_PARAM_END)
             return body[start:end], stop
@@ -64,8 +69,13 @@ def _param_value(body, start):
 
 
 def _convert_value(value, schema):
-    if not isinstance(schema, dict) or schema.get("type") in (None, "string"):
+    if not isinstance(schema, dict) or schema.get("type") == "string":
         return value
+    if not isinstance(schema.get("type"), str):
+        types = _extract_types_from_schema(schema)
+        if types == ["string"]:
+            return value
+        return _convert_param_value_with_types(value, types)
     try:
         return json.loads(value)
     except json.JSONDecodeError:
@@ -97,11 +107,11 @@ def _parse_arguments(body, properties):
 
 
 class MiniCPM5ToolParser:
-    """Parse XML4 using the full-response and incremental detector rules."""
+    """Parse complete XML4 calls and preserve text between them."""
 
     def __init__(self, tools):
         self._schemas = {}
-        for tool in tools:
+        for tool in tools or ():
             function = tool.get("function")
             if function and function.get("name"):
                 schema = function.get("parameters")
@@ -111,88 +121,117 @@ class MiniCPM5ToolParser:
                     set(schema.get("required") or ()),
                 )
         self._pending = ""
-        self._saw_call = False
+
+    def _parse_block(self, text, opening, close):
+        name = opening[2].strip()
+        literal = text[opening.start() : close + len(_END)]
+        if name not in self._schemas:
+            return literal, None
+        properties, required = self._schemas[name]
+        try:
+            arguments = _parse_arguments(text[opening.end() : close], properties)
+            if not required.issubset(arguments):
+                return "", None
+            json.dumps(arguments, allow_nan=False)
+        except (TypeError, ValueError, OverflowError):
+            return literal, None
+        return "", {"name": name, "arguments": arguments}
+
+    def _scan(self, text, *, final, reader=None):
+        """Yield text, parsed call, and whether the text belongs to an XML block."""
+        if not self._schemas:
+            yield text, None, False
+            return ""
+
+        pos = 0
+        while pos < len(text):
+            start = text.find(_START, pos)
+            if start == -1:
+                tail = text[pos:]
+                if not final:
+                    for prefix in _START_PREFIXES:
+                        if tail.endswith(prefix):
+                            yield tail[: -len(prefix)], None, False
+                            return prefix
+                yield tail, None, False
+                return ""
+
+            # The caller consumes the prefix before we consult its state.
+            yield text[pos:start], None, False
+            opening = (
+                _FUNCTION.match(text, start, partial=not final)
+                if reader is None or reader.state == "normal"
+                else None
+            )
+            if opening is None:
+                yield _START, None, False
+                pos = start + len(_START)
+                continue
+            if opening.partial:
+                return text[start:]
+
+            close = _function_end(text, opening.end(), final=final)
+            if close == -1:
+                if not final:
+                    return text[start:]
+                yield text[start:], None, True
+                return ""
+
+            content, call = self._parse_block(text, opening, close)
+            yield content, call, True
+            pos = close + len(_END)
+        return ""
+
+    def _advance(self, text, *, final, reader=None):
+        self._pending = yield from self._scan(
+            self._pending + text, final=final, reader=reader
+        )
+
+    @staticmethod
+    def _collect(pieces):
+        content, calls = [], []
+        for text, call, _ in pieces:
+            content.append(text)
+            if call is not None:
+                calls.append(call)
+        return "".join(content), calls
 
     def parse(self, text):
-        normal = []
-        calls = []
-        pos = 0
-        while (start := text.find(_START, pos)) != -1:
-            opening = _FUNCTION.match(text, start)
-            if opening is None:
-                break
-            close = _function_end(text, opening.end())
-            if close == -1:
-                break
-
-            normal.append(text[pos:start])
-            end = close + len(_END)
-            name = opening[1].strip()
-            if name not in self._schemas:
-                normal.append(text[start:end])
-            else:
-                properties, required = self._schemas[name]
-                arguments = _parse_arguments(text[opening.end() : close], properties)
-                if required.issubset(arguments):
-                    try:
-                        json.dumps(arguments)
-                    except TypeError:
-                        return text, []
-                    calls.append({"name": name, "arguments": arguments})
-            pos = end
-
-        normal.append(text[pos:])
-        return "".join(normal), calls
+        return self._collect(self._scan(text, final=True))
 
     def feed(self, text):
-        """Consume one complete block per chunk and keep the tail for the next chunk."""
-        self._pending += text
-        start = self._pending.find(_START)
-        if start == -1:
-            if any(self._pending.endswith(_START[:i]) for i in range(1, len(_START))):
-                return "", []
-            content = "" if self._saw_call else self._pending
-            self._pending = ""
-            return content, []
+        return self._collect(self._advance(text, final=False))
 
-        close = _function_end(self._pending, start)
-        if close == -1:
-            content = self._pending[:start]
-            self._pending = self._pending[start:]
-            return content, []
-
-        end = close + len(_END)
-        content, calls = self.parse(self._pending[:end])
-        self._pending = self._pending[end:]
-        if calls:
-            self._saw_call = True
-        return content, calls
+    def finish(self, text=""):
+        return self._collect(self._advance(text, final=True))
 
 
 class XML4Reader:
-    def __init__(self, initial_state, tools, *, streaming):
+    def __init__(self, reader, tools):
+        self._reader = reader
+        self._parser = MiniCPM5ToolParser(tools)
+
+    def _read(self, text, *, final):
         from ..generate import TextStateMachine
 
-        # The MiniCPM5 chat template determines the initial reasoning state.
-        self._reader = TextStateMachine({"reasoning": [("</think>", "normal")]}).reader(
-            state=initial_state
-        )
-        self._parser = MiniCPM5ToolParser(tools)
-        self._streaming = streaming
-        self._content = []
-
-    def _parse(self, delta, *, final=False):
-        if self._streaming:
-            content, calls = self._parser.feed(delta.content)
-        else:
-            self._content.append(delta.content)
-            if not final:
-                return replace(delta, content="")
-            content, calls = self._parser.parse("".join(self._content))
-        return replace(delta, content=content, tool_calls=tuple(calls))
+        delta = TextStateMachine.Delta()
+        for content, call, is_xml in self._parser._advance(
+            text, final=final, reader=self._reader
+        ):
+            if is_xml:
+                # A tool body may contain literal tokenizer control markers.
+                delta += self._reader.finish()
+                delta += TextStateMachine.Delta(
+                    content=content, tool_calls=(call,) if call is not None else ()
+                )
+            else:
+                delta += self._reader.feed(content)
+        if final:
+            delta += self._reader.finish()
+        return delta
 
     def feed(self, text):
-        return self._parse(self._reader.feed(text))
+        return self._read(text, final=False)
 
-    def finish(self, text):
-        return self._parse(self._reader.finish(text), final=True)
+    def finish(self, text=""):
+        return self._read(text, final=True)

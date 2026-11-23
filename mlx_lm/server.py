@@ -116,6 +116,13 @@ class ToolCallFormatter:
         return result
 
 
+def _use_minicpm5_xml4(request, cli_args):
+    return (
+        bool(request.tools)
+        and getattr(cli_args, "tool_call_parser", None) == "minicpm5"
+    )
+
+
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
     default_role_mapping = {
         "system_prompt": (
@@ -833,7 +840,12 @@ class ResponseGenerator:
                         continue
 
                     stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
+                    text_sm = TextStateMachine.from_tokenizer(
+                        current_tokenizer,
+                        include_tool_calls=not _use_minicpm5_xml4(
+                            request, self.cli_args
+                        ),
+                    )
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -1060,7 +1072,10 @@ class ResponseGenerator:
                 tokenizer, request, args
             )
             stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-            text_sm = TextStateMachine.from_tokenizer(tokenizer)
+            text_sm = TextStateMachine.from_tokenizer(
+                tokenizer,
+                include_tool_calls=not _use_minicpm5_xml4(request, self.cli_args),
+            )
 
             # Start the generation context
             ctx = GenerationContext(
@@ -1611,14 +1626,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Initialize the text state machine
         reader = ctx.text_sm.reader(state=ctx.initial_state)
-        if (
-            request.tools
-            and getattr(self.response_generator.cli_args, "tool_call_parser", None)
-            == "minicpm5"
-        ):
+        if _use_minicpm5_xml4(request, self.response_generator.cli_args):
             from .tool_parsers.minicpm5_xml4 import XML4Reader
 
-            reader = XML4Reader(ctx.initial_state, request.tools, streaming=self.stream)
+            reader = XML4Reader(reader, request.tools)
             tool_formatter = ToolCallFormatter(
                 lambda call, _: call, request.tools, self.stream
             )
