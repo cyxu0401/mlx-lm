@@ -2095,7 +2095,7 @@ def main():
     args = parser.parse_args()
     use_dspark = args.speculative_algorithm == "DSPARK"
     if use_dspark:
-        from .models.minicpm5_moe import dspark
+        from . import dspark
         from .utils import _download
 
         if args.draft_model is None:

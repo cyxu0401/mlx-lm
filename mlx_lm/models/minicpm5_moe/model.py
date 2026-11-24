@@ -6,6 +6,8 @@ import mlx.nn as nn
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.minicpm5_moe.layers import MLP, Attention, DecoderLayer, MoE
 
+__all__ = ["MiniCPM5", "Model"]
+
 
 class MiniCPM5(nn.Module):
     def __init__(self, args):

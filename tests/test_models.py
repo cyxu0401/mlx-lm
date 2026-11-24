@@ -1038,8 +1038,8 @@ class TestModels(unittest.TestCase):
             mx.eval(logits, next_logits)
 
     def test_minicpm5_dspark_matches_greedy(self):
+        from mlx_lm import dspark
         from mlx_lm.generate import generate_step, generation_stream
-        from mlx_lm.models.minicpm5_moe import dspark
 
         target = self._minicpm5_target()
         draft = dspark.Draft(

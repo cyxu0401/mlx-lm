@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from mlx_lm.models.base import BaseModelArgs
 
+__all__ = ["ModelArgs"]
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):

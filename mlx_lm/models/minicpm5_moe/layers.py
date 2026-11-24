@@ -8,6 +8,8 @@ from mlx_lm.layers.common import swiglu
 from mlx_lm.layers.moe import SwitchGLU
 from mlx_lm.models.deepseek_v3.layers import group_expert_select
 
+__all__ = ["Attention", "DecoderLayer", "MLP", "MoE", "make_rope"]
+
 
 def make_rope(args):
     parameters = args.rope_parameters or args.rope_scaling or {}

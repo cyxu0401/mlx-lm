@@ -2095,7 +2095,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     if args.speculative_algorithm == "DSPARK":
-        from .models.minicpm5_moe.serving import serve
+        from .dspark_server import serve
 
         return serve(args)
     run(args.host, args.port, ModelProvider(args))
