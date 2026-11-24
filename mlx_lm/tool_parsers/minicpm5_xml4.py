@@ -17,7 +17,7 @@ _CDATA_END = "]]>"
 _PARAM_END = "</param>"
 _FUNCTION = re.compile(r"""<function\s+name\s*=\s*(['"])([^'"<>]+)\1[^<>]*>""")
 _PARAM = re.compile(r"""<param\s+name=['"]([^'"]+)['"][^>]*>""")
-_FUNCTION_BOUNDARY = re.compile(r"</function>|<!\[CDATA\[")
+_CDATA_PARAM = re.compile(_PARAM.pattern + r"\s*" + re.escape(_CDATA))
 _PARAM_BOUNDARY = re.compile(r"</param>|<param")
 _WHITESPACE = re.compile(r"\s*")
 
@@ -39,14 +39,26 @@ def _schema_properties(schema):
 
 
 def _function_end(text, start, *, final):
-    while boundary := _FUNCTION_BOUNDARY.search(text, start):
-        if boundary.group() == _END:
-            return boundary.start()
-        end = text.find(_CDATA_END, boundary.end())
-        if end == -1:
-            # Recover a missing CDATA terminator only after generation ends.
-            return text.find(_END, boundary.end()) if final else -1
-        start = end + len(_CDATA_END)
+    while (close := text.find(_END, start)) != -1:
+        cdata = text.find(_CDATA, start, close)
+        if cdata == -1:
+            return close
+        cdata_end = text.find(_CDATA_END, cdata + len(_CDATA))
+        if cdata_end == -1:
+            # A later chunk may still close CDATA around this tag.
+            return close if final else -1
+
+        # If a later call opened CDATA, recover before the first following call.
+        recovery_close = None
+        for opening in _FUNCTION.finditer(text, close + len(_END), cdata_end):
+            if recovery_close is None:
+                recovery_close = text.rfind(_END, close, opening.start())
+            next_close = text.find(_END, opening.end(), cdata_end)
+            body_end = cdata_end if next_close == -1 else next_close
+            if _CDATA_PARAM.search(text, opening.end(), body_end):
+                return recovery_close
+
+        start = cdata_end + len(_CDATA_END)
     return -1
 
 

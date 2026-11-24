@@ -787,6 +787,56 @@ class TestToolParsing(unittest.TestCase):
                     ("", [{"name": "f", "arguments": {"city": " Paris ", "n": value}}]),
                 )
 
+    def test_minicpm5_xml4_recovers_missing_cdata_end(self):
+        tools = [{"function": {"name": "weather"}}]
+
+        def weather(city):
+            return (
+                f'<function name="weather"><param name="city">{city}</param></function>'
+            )
+
+        paris = weather("<![CDATA[Paris")
+        tokyo = weather("<![CDATA[Tokyo]]>")
+        literal_xml = "Example:</function>" + weather("Literal city")
+        cases = {
+            "adjacent": (paris + tokyo, "", ["Paris", "Tokyo"]),
+            "closed_cdata": (
+                weather("<![CDATA[Paris]]>") + tokyo,
+                "",
+                ["Paris", "Tokyo"],
+            ),
+            "with_text": (
+                paris + "\nContinuing.\n" + tokyo,
+                "\nContinuing.\n",
+                ["Paris", "Tokyo"],
+            ),
+            "with_plain_call": (
+                paris + weather("Berlin") + tokyo,
+                "",
+                ["Paris", "Berlin", "Tokyo"],
+            ),
+            "complete_cdata": (
+                weather(f"<![CDATA[{literal_xml}]]>") + tokyo,
+                "",
+                [literal_xml, "Tokyo"],
+            ),
+        }
+        for name, (text, content, cities) in cases.items():
+            calls = [
+                {"name": "weather", "arguments": {"city": city}} for city in cities
+            ]
+            with self.subTest(case=name, stream=False):
+                parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+                self.assertEqual(parser.parse(text), (content, calls))
+            with self.subTest(case=name, stream=True):
+                parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+                deltas = [parser.feed(character) for character in text]
+                deltas.append(parser.finish())
+                self.assertEqual("".join(part for part, _ in deltas), content)
+                self.assertEqual(
+                    [call for _, chunk_calls in deltas for call in chunk_calls], calls
+                )
+
     def test_minicpm5_xml4_invalid_arguments_do_not_discard_other_calls(self):
         tools = [
             {
