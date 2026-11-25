@@ -1000,6 +1000,105 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    @staticmethod
+    def _minicpm5_target():
+        from mlx_lm.models.minicpm5_moe import Model, ModelArgs
+
+        return Model(
+            ModelArgs(
+                model_type="minicpm5_moe",
+                hidden_size=64,
+                intermediate_size=128,
+                moe_intermediate_size=64,
+                vocab_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=32,
+                n_routed_experts=4,
+                n_shared_experts=1,
+                num_experts_per_tok=2,
+                first_k_dense_replace=1,
+                use_gated_attention=True,
+            )
+        )
+
+    def test_minicpm5_moe(self):
+        model = self._minicpm5_target()
+        self.assertEqual(model.model_type, "minicpm5_moe")
+        inputs = mx.array([[0, 1], [2, 3]])
+        # CPU GatherMM supports float32.
+        dtypes = (
+            (mx.float32,) if mx.default_device() == mx.cpu else (mx.float32, mx.float16)
+        )
+        for dtype in dtypes:
+            model.set_dtype(dtype)
+            cache = make_prompt_cache(model)
+            logits = model(inputs, cache=cache)
+            self.assertEqual(logits.shape, (2, 2, model.args.vocab_size))
+            self.assertEqual(logits.dtype, mx.float32)
+            next_logits = model(inputs[:, :1], cache=cache)
+            self.assertEqual(next_logits.shape, (2, 1, model.args.vocab_size))
+            mx.eval(logits, next_logits)
+
+    def test_minicpm5_dspark_matches_greedy(self):
+        from unittest.mock import patch
+
+        from mlx_lm import dspark
+        from mlx_lm.generate import generate_step, generation_stream
+
+        target = self._minicpm5_target()
+        draft = dspark.Draft(
+            dspark.DraftArgs(
+                hidden_size=64,
+                intermediate_size=128,
+                vocab_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=32,
+                target_layer_ids=[1, 0],
+                block_size=3,
+                mask_token_id=0,
+                markov_rank=8,
+                markov_head_type="vanilla",
+                num_target_layers=2,
+            )
+        )
+        prompt = mx.arange(19) % 32
+        expected = [
+            token
+            for token, _ in generate_step(
+                prompt, target, max_tokens=11, prefill_step_size=8
+            )
+        ]
+        for limit, first_proposal in ((None, 3), (1, 1), (2, 2), (9, 3), (0, 0)):
+            with (
+                self.subTest(num_draft_tokens=limit),
+                patch.object(draft, "propose", wraps=draft.propose) as propose,
+            ):
+                stats = dspark.DraftStats()
+                actual = [
+                    token
+                    for token, _, _ in draft.speculative_generate_step(
+                        prompt,
+                        target,
+                        generation_stream,
+                        max_tokens=11,
+                        num_draft_tokens=limit,
+                        prefill_step_size=8,
+                        dspark_stats=stats,
+                        prompt_cache=make_prompt_cache(target)
+                        + make_prompt_cache(draft),
+                    )
+                ]
+                self.assertEqual(actual, expected)
+                counts = [call.args[3] for call in propose.call_args_list]
+                self.assertEqual(counts[:1], [first_proposal] if first_proposal else [])
+                self.assertLessEqual(max(counts, default=0), first_proposal)
+                self.assertEqual(stats.steps, len(counts))
+                self.assertEqual(stats.proposed, sum(counts))
+
     def check_moe_sanitize(self, model, num_experts, moe_attr):
         """Expert stacking must not be gated on layer 0 being an MoE layer."""
         moe = [i for i, l in enumerate(model.model.layers) if hasattr(l.mlp, moe_attr)]
@@ -2757,6 +2856,21 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_group_expert_select_masks_dropped_groups(self):
+        from mlx_lm.models.deepseek_v3.layers import group_expert_select
+
+        indices, weights = group_expert_select(
+            mx.zeros((1, 1, 4)),
+            mx.array([-1.0, -1.0, -2.0, -2.0]),
+            top_k=2,
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            norm_topk_prob=True,
+        )
+        self.assertEqual(mx.sort(indices, axis=-1).tolist(), [[[0, 1]]])
+        self.assertEqual(weights.tolist(), [[[0.5, 0.5]]])
 
     def test_deepseek_v3(self):
         from mlx_lm.models import deepseek_v3

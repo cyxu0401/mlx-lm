@@ -59,6 +59,7 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+DEFAULT_NUM_DRAFT_TOKENS = 3
 
 
 def str2bool(string):
@@ -228,15 +229,17 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--draft-model",
+        "--speculative-draft-model-path",
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
     )
+    parser.add_argument("--speculative-algorithm", choices=["DSPARK"])
     parser.add_argument(
         "--num-draft-tokens",
+        "--spec-n-max",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
-        default=3,
+        help="Maximum draft tokens per step (default: 3 or the DSpark block size).",
     )
     return parser
 
@@ -731,6 +734,12 @@ def stream_generate(
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
+        )
+    elif (
+        draft_step := getattr(draft_model, "speculative_generate_step", None)
+    ) is not None:
+        token_generator = draft_step(
+            prompt, model, stream, eos_token_ids=tokenizer.eos_token_ids, **kwargs
         )
     else:
         kwargs.pop("max_kv_size", None)
@@ -2085,6 +2094,19 @@ def batch_generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    use_dspark = args.speculative_algorithm == "DSPARK"
+    if args.num_draft_tokens is not None and args.num_draft_tokens < 0:
+        parser.error("--num-draft-tokens must be nonnegative.")
+    if args.num_draft_tokens is None and not use_dspark:
+        args.num_draft_tokens = DEFAULT_NUM_DRAFT_TOKENS
+    if use_dspark:
+        from . import dspark
+        from .utils import _download
+
+        if args.draft_model is None:
+            parser.error("DSPARK requires --speculative-draft-model-path.")
+        if args.min_p or args.xtc_probability:
+            parser.error("DSPARK supports temperature, top-k and top-p sampling.")
 
     if args.seed is not None:
         mx.random.seed(args.seed)
@@ -2191,7 +2213,9 @@ def main():
     else:
         input_embeddings = None
 
-    if args.draft_model is not None:
+    if use_dspark:
+        draft_model = dspark.load_draft(_download(args.draft_model), model)
+    elif args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
@@ -2207,6 +2231,8 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+    if use_dspark:
+        sampler = dspark.Sampling(args.temp, args.top_k, args.top_p or 1.0)
     response = generate(
         model,
         tokenizer,

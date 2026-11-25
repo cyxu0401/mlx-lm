@@ -30,6 +30,30 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+### MiniCPM5 with DSpark
+
+Use a prepared MiniCPM5-15B-A2.5B MLX affine checkpoint and the matching DSpark draft.
+
+```shell
+python -m mlx_lm server \
+  --model-path /path/to/mlx-checkpoint \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path /path/to/dspark-checkpoint \
+  --prefill-step-size 128 \
+  --allocator-cache-limit 268435456
+```
+
+The allocator limit caps reusable MLX buffers at 256 MiB in this example.
+The target and draft stay loaded across requests. Each request builds its own
+target and draft K/V caches. DSpark handles requests sequentially and supports
+greedy decoding, temperature, top-k and top-p. The server logs the number of
+proposed and accepted draft tokens per request.
+
+Set `--num-draft-tokens N` (alias `--spec-n-max N`) to cap DSpark proposals per
+step. The default is the draft's `block_size`, which is also the upper bound.
+Set `num_draft_tokens` in the request to override the server setting. A value
+of `0` generates with the target model only.
+
 ### KV Cache Quantization
 
 Use `--kv-bits` to quantize the KV cache and save memory on long-context
@@ -128,8 +152,9 @@ curl localhost:8080/v1/chat/completions \
 - `draft_model`: (Optional) Specifies a smaller model to use for speculative
   decoding. Set to `null` to unload.
 
-- `num_draft_tokens`: (Optional) The number of draft tokens the draft model
-  should predict at once. Defaults to `3`.
+- `num_draft_tokens`: (Optional) Maximum draft tokens per step. Uses the server
+  setting when omitted. See [MiniCPM5 with DSpark](#minicpm5-with-dspark) for
+  DSpark limits.
 
 ### Response Fields
 

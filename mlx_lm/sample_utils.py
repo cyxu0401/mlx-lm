@@ -49,7 +49,32 @@ def make_sampler(
     if temp == 0:
         return greedy_sampler
 
-    # Create sampler chain
+    filter_logprobs = make_sampling_filter(
+        top_p,
+        min_p,
+        min_tokens_to_keep,
+        top_k,
+        xtc_probability,
+        xtc_threshold,
+        xtc_special_tokens,
+    )
+
+    def sampler(logprobs: mx.array) -> mx.array:
+        return categorical_sampling(filter_logprobs(logprobs), temp)
+
+    return sampler
+
+
+def make_sampling_filter(
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.1,
+    xtc_special_tokens: Optional[List[int]] = None,
+) -> Callable[[mx.array], mx.array]:
+    """Build the filters applied to log probabilities before temperature scaling."""
     xtc_special_tokens = [] if xtc_special_tokens is None else xtc_special_tokens
     sampling_methods = []
     if 0 < top_p < 1.0:
@@ -63,14 +88,12 @@ def make_sampler(
     if top_k > 0:
         sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
-    # Apply the sampling methods
-    def sampler(logprobs: mx.array) -> mx.array:
+    def filter_logprobs(logprobs: mx.array) -> mx.array:
         for method in sampling_methods:
             logprobs = method(logprobs)
-        # Return the sampled token
-        return categorical_sampling(logprobs, temp)
+        return logprobs
 
-    return sampler
+    return filter_logprobs
 
 
 def make_logits_processors(

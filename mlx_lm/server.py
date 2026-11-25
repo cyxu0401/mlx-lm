@@ -38,6 +38,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_NUM_DRAFT_TOKENS,
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     TextState,
@@ -296,7 +297,7 @@ class GenerationArguments:
     stop_words: List[str]
 
     max_tokens: int
-    num_draft_tokens: int
+    num_draft_tokens: Optional[int]
     logprobs: bool
     top_logprobs: int
     seed: Optional[int]
@@ -1079,6 +1080,9 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
+            draft_sampler = getattr(draft_model, "speculative_sampler", None)
+            if draft_sampler is not None:
+                sampler = draft_sampler(args.sampling)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
@@ -1133,7 +1137,11 @@ class ResponseGenerator:
                     Response(
                         text,
                         gen.token,
-                        gen.logprobs[gen.token].item(),
+                        (
+                            gen.logprobs[gen.token].item()
+                            if args.logprobs or draft_sampler is None
+                            else 0.0
+                        ),
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
@@ -1395,7 +1403,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
         self._validate("min_p", (float, int), min_val=0, max_val=1)
-        self._validate("num_draft_tokens", int, min_val=0)
+        self._validate(
+            "num_draft_tokens",
+            int,
+            min_val=0,
+            optional="num_draft_tokens" not in self.body,
+        )
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))
@@ -1912,6 +1925,7 @@ def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
+        "--model-path",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
     )
@@ -1940,15 +1954,17 @@ def main():
     )
     parser.add_argument(
         "--draft-model",
+        "--speculative-draft-model-path",
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
     )
+    parser.add_argument("--speculative-algorithm", choices=["DSPARK"])
     parser.add_argument(
         "--num-draft-tokens",
+        "--spec-n-max",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
-        default=3,
+        help="Maximum draft tokens per step (default: 3 or the DSpark block size).",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -2040,6 +2056,11 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--allocator-cache-limit",
+        type=_parse_size,
+        help="Maximum size in bytes of reusable MLX allocator buffers.",
+    )
+    parser.add_argument(
         "--kv-bits",
         type=int,
         default=None,
@@ -2066,12 +2087,27 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.num_draft_tokens is not None and args.num_draft_tokens < 0:
+        parser.error("--num-draft-tokens must be nonnegative.")
+    if args.speculative_algorithm == "DSPARK":
+        if args.draft_model is None:
+            parser.error("DSPARK requires --speculative-draft-model-path.")
+        if args.kv_bits is not None:
+            parser.error("DSPARK uses full-precision KV caches.")
+    elif args.num_draft_tokens is None:
+        args.num_draft_tokens = DEFAULT_NUM_DRAFT_TOKENS
     _ = maybe_set_recommended_wired_limit()
+    if args.allocator_cache_limit is not None:
+        mx.set_cache_limit(args.allocator_cache_limit)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    if args.speculative_algorithm == "DSPARK":
+        from .dspark_server import serve
+
+        return serve(args)
     run(args.host, args.port, ModelProvider(args))
 
 
