@@ -30,35 +30,6 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
-### MiniCPM5 with DSpark
-
-Use a MiniCPM5-15B-A2.5B MLX affine checkpoint and the matching DSpark draft.
-For a compressed-tensors asymmetric GPTQ INT4 checkpoint with group size
-128, run the conversion once.
-
-```shell
-python -m mlx_lm.quant.minicpm5 /path/to/gptq-checkpoint /path/to/mlx-checkpoint
-```
-
-The converter preserves the INT4 codes and scales. It writes the affine bias
-and stacks the routed expert tensors. Pass the converted directory to the server.
-
-```shell
-python -m mlx_lm server \
-  --model-path /path/to/mlx-checkpoint \
-  --speculative-algorithm DSPARK \
-  --speculative-draft-model-path /path/to/dspark-checkpoint \
-  --prefill-step-size 128 \
-  --allocator-cache-limit 268435456
-```
-
-The allocator limit caps reusable MLX buffers at 256 MiB in this example.
-The target and draft stay loaded across requests. Each request builds its own
-target and draft K/V caches and uses the proposal block size in the draft
-config. DSpark handles requests sequentially and supports greedy decoding,
-temperature, top-k and top-p. The server logs the number of proposed and
-accepted draft tokens per request.
-
 ### KV Cache Quantization
 
 Use `--kv-bits` to quantize the KV cache and save memory on long-context

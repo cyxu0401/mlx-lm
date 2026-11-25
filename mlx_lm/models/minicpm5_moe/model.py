@@ -27,17 +27,14 @@ class MiniCPM5(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, cache, capture_layers, input_embeddings=None):
+    def __call__(self, inputs, cache, input_embeddings=None):
         h = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(h, cache[0])
-        captured = {}
-        for index, (layer, entry) in enumerate(zip(self.layers, cache)):
+        for layer, entry in zip(self.layers, cache):
             h = layer(h, mask, entry)
-            if index in capture_layers:
-                captured[index] = h
-        return self.norm(h), tuple(captured[index] for index in capture_layers)
+        return self.norm(h)
 
 
 class Model(nn.Module):
@@ -61,11 +58,5 @@ class Model(nn.Module):
         return self.lm_head(h)
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
-        h, _ = self.model(inputs, cache, (), input_embeddings)
+        h = self.model(inputs, cache, input_embeddings)
         return self.project_logits(h).astype(mx.float32)
-
-    def capture(self, inputs, cache, layers, last_only=False):
-        h, features = self.model(inputs, cache, layers)
-        if last_only:
-            h = h[:, -1:]
-        return self.project_logits(h).astype(mx.float32), features

@@ -1079,9 +1079,6 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            draft_sampler = getattr(draft_model, "speculative_sampler", None)
-            if draft_sampler is not None:
-                sampler = draft_sampler(args.sampling)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
@@ -1136,11 +1133,7 @@ class ResponseGenerator:
                     Response(
                         text,
                         gen.token,
-                        (
-                            gen.logprobs[gen.token].item()
-                            if args.logprobs or draft_sampler is None
-                            else 0.0
-                        ),
+                        gen.logprobs[gen.token].item(),
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
@@ -1919,7 +1912,6 @@ def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
-        "--model-path",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
     )
@@ -1948,12 +1940,10 @@ def main():
     )
     parser.add_argument(
         "--draft-model",
-        "--speculative-draft-model-path",
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
     )
-    parser.add_argument("--speculative-algorithm", choices=["DSPARK"])
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
@@ -2050,11 +2040,6 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
-        "--allocator-cache-limit",
-        type=_parse_size,
-        help="Maximum size in bytes of reusable MLX allocator buffers.",
-    )
-    parser.add_argument(
         "--kv-bits",
         type=int,
         default=None,
@@ -2081,23 +2066,12 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if args.speculative_algorithm == "DSPARK":
-        if args.draft_model is None:
-            parser.error("DSPARK requires --speculative-draft-model-path.")
-        if args.kv_bits is not None:
-            parser.error("DSPARK uses full-precision KV caches.")
     _ = maybe_set_recommended_wired_limit()
-    if args.allocator_cache_limit is not None:
-        mx.set_cache_limit(args.allocator_cache_limit)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    if args.speculative_algorithm == "DSPARK":
-        from .dspark_server import serve
-
-        return serve(args)
     run(args.host, args.port, ModelProvider(args))
 
 
