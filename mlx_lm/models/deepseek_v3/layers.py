@@ -185,7 +185,7 @@ def group_expert_select(
         k = n_group - topk_group
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
         scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            scores, mx.stop_gradient(group_idx), mx.array(-mx.inf), axis=-2
         )
         scores = mx.flatten(scores, -2, -1)
 

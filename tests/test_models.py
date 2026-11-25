@@ -2857,6 +2857,21 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_group_expert_select_masks_dropped_groups(self):
+        from mlx_lm.models.deepseek_v3.layers import group_expert_select
+
+        indices, weights = group_expert_select(
+            mx.zeros((1, 1, 4)),
+            mx.array([-1.0, -1.0, -2.0, -2.0]),
+            top_k=2,
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            norm_topk_prob=True,
+        )
+        self.assertEqual(mx.sort(indices, axis=-1).tolist(), [[[0, 1]]])
+        self.assertEqual(weights.tolist(), [[[0.5, 0.5]]])
+
     def test_deepseek_v3(self):
         from mlx_lm.models import deepseek_v3
 
