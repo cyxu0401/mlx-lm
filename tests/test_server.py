@@ -26,7 +26,7 @@ from mlx_lm.server import (
     _apply_stop_words,
     _make_sampler,
 )
-from mlx_lm.tool_parsers import json_tools, pythonic
+from mlx_lm.tool_parsers import json_tools, minicpm5, pythonic
 from mlx_lm.utils import load
 
 
@@ -262,6 +262,39 @@ class TestHandleCompletion(unittest.TestCase):
         self.assertEqual(
             sent, [("Hi.", None, []), ("", None, ["f"]), ("", "tool_calls", [])]
         )
+
+    def test_minicpm5_reader_selection(self):
+        tools = [{"function": {"name": "f", "parameters": {"required": ["city"]}}}]
+        good = '<function name="f"><param name="city"><![CDATA[a</function>b]]></param></function>'
+        bad = '<function name="f"><param name="days">2</param></function>'
+        call = {"name": "f", "arguments": {"city": "a</function>b"}}
+        for parser, override in ((minicpm5.parse_tool_call, None), (None, "minicpm5")):
+            with self.subTest(override=override):
+                tokenizer = SimpleNamespace(
+                    tool_parser=parser,
+                    has_tool_calling=parser is not None,
+                    has_thinking=False,
+                    tool_call_start=minicpm5.tool_call_start,
+                    tool_call_end=minicpm5.tool_call_end,
+                    structural_markers=[],
+                    response_transitions={},
+                )
+                ctx = GenerationContext.from_tokenizer(
+                    tokenizer, SimpleNamespace(tool_call_parser=override), "normal", []
+                )
+                text = bad + good + " tail"
+                expected = TextStateMachine.Delta(
+                    content=bad + " tail", tool_calls=(call,)
+                )
+                self.assertEqual(ctx.reader(tools).finish(text), expected)
+                reader = ctx.reader(tools)
+                delta = TextStateMachine.Delta()
+                for char in text:
+                    delta += reader.feed(char)
+                self.assertEqual(delta + reader.finish(), expected)
+                self.assertEqual(
+                    ctx.reader([]).finish(text), TextStateMachine.Delta(content=text)
+                )
 
     def test_held_text_read_once(self):
         reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
