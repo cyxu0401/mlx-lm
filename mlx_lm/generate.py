@@ -59,6 +59,7 @@ DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+DEFAULT_NUM_DRAFT_TOKENS = 3
 
 
 def str2bool(string):
@@ -236,9 +237,9 @@ def setup_arg_parser():
     parser.add_argument("--speculative-algorithm", choices=["DSPARK"])
     parser.add_argument(
         "--num-draft-tokens",
+        "--spec-n-max",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
-        default=3,
+        help="Maximum draft tokens per step (default: 3 or the DSpark block size).",
     )
     return parser
 
@@ -2094,6 +2095,10 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
     use_dspark = args.speculative_algorithm == "DSPARK"
+    if args.num_draft_tokens is not None and args.num_draft_tokens < 0:
+        parser.error("--num-draft-tokens must be nonnegative.")
+    if args.num_draft_tokens is None and not use_dspark:
+        args.num_draft_tokens = DEFAULT_NUM_DRAFT_TOKENS
     if use_dspark:
         from . import dspark
         from .utils import _download

@@ -14,11 +14,12 @@ from typing import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.generate import generate_step as target_generate_step
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import KVCache, make_prompt_cache, trim_prompt_cache
 from mlx_lm.models.minicpm5_moe.layers import MLP, DecoderLayer, make_rope
 from mlx_lm.models.minicpm5_moe.model import Model
-from mlx_lm.sample_utils import make_sampling_filter
+from mlx_lm.sample_utils import make_sampler, make_sampling_filter
 
 
 @dataclass
@@ -155,7 +156,7 @@ class Draft(nn.Module):
             unsupported.append("logits_processors")
         if unsupported:
             raise ValueError(f"DSpark does not support {', '.join(unsupported)}.")
-        for key in ("num_draft_tokens", "kv_group_size", "quantized_kv_start"):
+        for key in ("kv_group_size", "quantized_kv_start"):
             kwargs.pop(key, None)
         stats = dspark_stats if dspark_stats is not None else DraftStats()
         steps = generate_step(prompt, target, self, stream, stats=stats, **kwargs)
@@ -214,7 +215,7 @@ def load_draft(path: Path, target):
 
     draft = Draft(args)
     weights = mx.load(str(path / "model.safetensors"))
-    # Fixed verification width does not use confidence-based scheduling.
+    # The proposal cap comes from the draft config or a request setting.
     weights.pop("confidence_head.proj.weight", None)
     weights.pop("confidence_head.proj.bias", None)
     draft.load_weights(list(weights.items()))
@@ -314,6 +315,7 @@ def generate_step(
     stream,
     *,
     max_tokens,
+    num_draft_tokens: int | None = None,
     sampler=None,
     stats=None,
     eos_token_ids=(),
@@ -336,6 +338,12 @@ def generate_step(
         raise ValueError(
             "Expected a nonempty 1-D prompt and positive token/step limits."
         )
+    proposal_limit = draft.args.block_size
+    if num_draft_tokens is not None:
+        if not isinstance(num_draft_tokens, int) or num_draft_tokens < 0:
+            raise ValueError("num_draft_tokens must be a nonnegative integer.")
+        proposal_limit = min(proposal_limit, num_draft_tokens)
+
     if prompt_cache is None:
         target_cache = make_prompt_cache(target)
         draft_cache = [KVCache() for _ in draft.layers]
@@ -346,6 +354,27 @@ def generate_step(
             raise ValueError("DSpark requires an empty target and draft KV cache.")
         target_cache = prompt_cache[: len(target.layers)]
         draft_cache = prompt_cache[len(target.layers) :]
+
+    if proposal_limit == 0:
+        steps = target_generate_step(
+            prompt,
+            target,
+            stream,
+            max_tokens=max_tokens,
+            sampler=make_sampler(
+                temp=sampling.temperature, top_p=sampling.top_p, top_k=sampling.top_k
+            ),
+            prompt_cache=target_cache,
+            prefill_step_size=prefill_step_size,
+            prompt_progress_callback=prompt_progress_callback,
+        )
+        with closing(steps):
+            for token, logprobs in steps:
+                yield token, logprobs, False
+                if token in eos_token_ids:
+                    return
+        return
+
     capture = draft.args.target_layer_ids
 
     with mx.stream(stream):
@@ -372,7 +401,7 @@ def generate_step(
 
         remaining = max_tokens - 1
         while remaining > 1:
-            count = min(draft.args.block_size, remaining - 1)
+            count = min(proposal_limit, remaining - 1)
             proposals, draft_distributions = draft.propose(
                 target, anchor, draft_cache, count, sampling
             )

@@ -1042,6 +1042,8 @@ class TestModels(unittest.TestCase):
             mx.eval(logits, next_logits)
 
     def test_minicpm5_dspark_matches_greedy(self):
+        from unittest.mock import patch
+
         from mlx_lm import dspark
         from mlx_lm.generate import generate_step, generation_stream
 
@@ -1070,21 +1072,32 @@ class TestModels(unittest.TestCase):
                 prompt, target, max_tokens=11, prefill_step_size=8
             )
         ]
-        stats = dspark.DraftStats()
-        actual = [
-            token
-            for token, _, _ in draft.speculative_generate_step(
-                prompt,
-                target,
-                generation_stream,
-                max_tokens=11,
-                prefill_step_size=8,
-                dspark_stats=stats,
-                prompt_cache=make_prompt_cache(target) + make_prompt_cache(draft),
-            )
-        ]
-        self.assertEqual(actual, expected)
-        self.assertGreater(stats.steps, 0)
+        for limit, first_proposal in ((None, 3), (1, 1), (2, 2), (9, 3), (0, 0)):
+            with (
+                self.subTest(num_draft_tokens=limit),
+                patch.object(draft, "propose", wraps=draft.propose) as propose,
+            ):
+                stats = dspark.DraftStats()
+                actual = [
+                    token
+                    for token, _, _ in draft.speculative_generate_step(
+                        prompt,
+                        target,
+                        generation_stream,
+                        max_tokens=11,
+                        num_draft_tokens=limit,
+                        prefill_step_size=8,
+                        dspark_stats=stats,
+                        prompt_cache=make_prompt_cache(target)
+                        + make_prompt_cache(draft),
+                    )
+                ]
+                self.assertEqual(actual, expected)
+                counts = [call.args[3] for call in propose.call_args_list]
+                self.assertEqual(counts[:1], [first_proposal] if first_proposal else [])
+                self.assertLessEqual(max(counts, default=0), first_proposal)
+                self.assertEqual(stats.steps, len(counts))
+                self.assertEqual(stats.proposed, sum(counts))
 
     def check_moe_sanitize(self, model, num_experts, moe_attr):
         """Expert stacking must not be gated on layer 0 being an MoE layer."""
