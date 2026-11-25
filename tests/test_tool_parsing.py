@@ -13,7 +13,6 @@ from mlx_lm.tool_parsers import (
     kimi_k3,
     longcat,
     minicpm5,
-    minicpm5_xml4,
     minimax_m2,
     mistral,
     muse_spark,
@@ -652,7 +651,7 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         test_cases = [
-            # Markers stripped, as the server passes it.
+            # A caller can pass the text between the function markers.
             (
                 '"f"><param name="city">Paris</param><param name="days">3</param>'
                 '<param name="metric">true</param>',
@@ -667,10 +666,10 @@ class TestToolParsing(unittest.TestCase):
                 '<param name="city"><![CDATA[a\n<b>&</b>\n]]></param></function>',
                 {"days": 3, "city": "a\n<b>&</b>\n"},
             ),
-            # Truncated: complete params survive.
+            # A stripped call may omit the final parameter's end tag.
             (
                 '"f"><param name="city">Paris</param><param name="days">3',
-                {"city": "Paris"},
+                {"city": "Paris", "days": 3},
             ),
             ('<function name="f"><param name="city"></param></function>', {"city": ""}),
             # Nullable keeps its value; "None" stays a string.
@@ -698,14 +697,13 @@ class TestToolParsing(unittest.TestCase):
             [
                 {"name": "f", "arguments": {"days": 3}},
                 {"name": "g", "arguments": {"nums": [1, 2]}},
-                {"name": "h", "arguments": {}},
             ],
         )
 
         with self.assertRaises(ValueError):
             minicpm5.parse_tool_call("no call here", tools)
 
-    def test_minicpm5_xml4_response_modes(self):
+    def test_minicpm5_response_modes(self):
         tools = [
             {
                 "type": "function",
@@ -718,7 +716,7 @@ class TestToolParsing(unittest.TestCase):
                 },
             },
         ]
-        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        parser = minicpm5.MiniCPM5ToolParser(tools)
         call = '<function name="f"><param name="city">Paris</param></function>'
         opening = '<function name="f"><param name="city"><![CDATA['
         cdata = (
@@ -743,11 +741,11 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(parser.feed(" between "), (" between ", []))
         self.assertEqual(parser.finish(call + " tail"), (" tail", [paris]))
 
-    def test_minicpm5_xml4_literal_and_incomplete_markup(self):
+    def test_minicpm5_literal_and_incomplete_markup(self):
         tools = [{"function": {"name": "f"}}]
         call = '<function name="f"></function>'
         expected = [{"name": "f", "arguments": {}}]
-        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        parser = minicpm5.MiniCPM5ToolParser(tools)
         self.assertEqual(
             parser.parse("use <function> then " + call),
             ("use <function> then ", expected),
@@ -761,7 +759,7 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(parser.feed(unfinished), ("", []))
         self.assertEqual(parser.finish(), (unfinished, []))
 
-    def test_minicpm5_xml4_cdata_and_composed_types(self):
+    def test_minicpm5_cdata_and_composed_types(self):
         tools = [
             {
                 "function": {
@@ -775,7 +773,7 @@ class TestToolParsing(unittest.TestCase):
                 }
             }
         ]
-        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        parser = minicpm5.MiniCPM5ToolParser(tools)
         for raw, value in (("5", 5), ("null", None)):
             with self.subTest(raw=raw):
                 text = (
@@ -787,7 +785,7 @@ class TestToolParsing(unittest.TestCase):
                     ("", [{"name": "f", "arguments": {"city": " Paris ", "n": value}}]),
                 )
 
-    def test_minicpm5_xml4_recovers_missing_cdata_end(self):
+    def test_minicpm5_recovers_missing_cdata_end(self):
         tools = [{"function": {"name": "weather"}}]
 
         def weather(city):
@@ -826,10 +824,10 @@ class TestToolParsing(unittest.TestCase):
                 {"name": "weather", "arguments": {"city": city}} for city in cities
             ]
             with self.subTest(case=name, stream=False):
-                parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+                parser = minicpm5.MiniCPM5ToolParser(tools)
                 self.assertEqual(parser.parse(text), (content, calls))
             with self.subTest(case=name, stream=True):
-                parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+                parser = minicpm5.MiniCPM5ToolParser(tools)
                 deltas = [parser.feed(character) for character in text]
                 deltas.append(parser.finish())
                 self.assertEqual("".join(part for part, _ in deltas), content)
@@ -837,7 +835,7 @@ class TestToolParsing(unittest.TestCase):
                     [call for _, chunk_calls in deltas for call in chunk_calls], calls
                 )
 
-    def test_minicpm5_xml4_invalid_arguments_do_not_discard_other_calls(self):
+    def test_minicpm5_invalid_arguments_do_not_discard_other_calls(self):
         tools = [
             {
                 "function": {
@@ -849,15 +847,15 @@ class TestToolParsing(unittest.TestCase):
         good = '<function name="f"></function>'
         bad = '<function name="f"><param name="items">{1, 2}</param></function>'
         valid = {"name": "f", "arguments": {}}
-        parser = minicpm5_xml4.MiniCPM5ToolParser(tools)
+        parser = minicpm5.MiniCPM5ToolParser(tools)
         self.assertEqual(parser.parse(good + bad + good), (bad, [valid, valid]))
         self.assertEqual(parser.finish(good + bad + good), (bad, [valid, valid]))
         for empty_tools in (None, []):
             with self.subTest(tools=empty_tools):
-                parser = minicpm5_xml4.MiniCPM5ToolParser(empty_tools)
+                parser = minicpm5.MiniCPM5ToolParser(empty_tools)
                 self.assertEqual(parser.feed(good), (good, []))
 
-    def test_minicpm5_xml4_reader_preserves_tokenizer_markers(self):
+    def test_minicpm5_reader_preserves_tokenizer_markers(self):
         tokenizer = SimpleNamespace(
             has_thinking=True,
             think_start="<analysis>",
@@ -891,9 +889,9 @@ class TestToolParsing(unittest.TestCase):
                 },
             ),
         )
-        reader = minicpm5_xml4.XML4Reader(machine.reader(), tools)
+        reader = minicpm5.MiniCPM5Reader(machine.reader(), tools)
         self.assertEqual(reader.finish(output), expected)
-        reader = minicpm5_xml4.XML4Reader(machine.reader(), tools)
+        reader = minicpm5.MiniCPM5Reader(machine.reader(), tools)
         delta = TextStateMachine.Delta()
         for character in output:
             delta += reader.feed(character)

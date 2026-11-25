@@ -47,6 +47,7 @@ from .generate import (
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .processors import load_processor
 from .sample_utils import make_logits_processors, make_sampler
+from .tool_parsers import minicpm5
 from .utils import (
     _parse_size,
     load,
@@ -95,10 +96,14 @@ class ToolCallFormatter:
             return []
 
         result = []
-        for tool_text in tool_calls:
+        for call in tool_calls:
             # A broken tool call is dropped, whatever the parser raises.
             try:
-                parsed = self._tool_parser(tool_text, self._tools)
+                parsed = (
+                    self._tool_parser(call, self._tools)
+                    if isinstance(call, str)
+                    else call
+                )
                 if not isinstance(parsed, list):
                     parsed = [parsed]
                 formatted = [self._format(tc) for tc in parsed]
@@ -114,13 +119,6 @@ class ToolCallFormatter:
                 self.count += 1
                 result.append(out)
         return result
-
-
-def _use_minicpm5_xml4(request, cli_args):
-    return (
-        bool(request.tools)
-        and getattr(cli_args, "tool_call_parser", None) == "minicpm5"
-    )
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -334,6 +332,32 @@ class GenerationContext:
     prompt_cache_count: int = -1
 
     _should_stop: bool = False
+
+    @classmethod
+    def from_tokenizer(
+        cls, tokenizer, cli_args, initial_state, prompt, prompt_cache_count=-1
+    ):
+        parser = tokenizer.tool_parser
+        if getattr(cli_args, "tool_call_parser", None) == "minicpm5":
+            parser = minicpm5.parse_tool_call
+        return cls(
+            has_tool_calling=tokenizer.has_tool_calling
+            or parser is minicpm5.parse_tool_call,
+            has_thinking=tokenizer.has_thinking,
+            tool_parser=parser,
+            text_sm=TextStateMachine.from_tokenizer(
+                tokenizer, include_tool_calls=parser is not minicpm5.parse_tool_call
+            ),
+            initial_state=initial_state,
+            prompt=prompt,
+            prompt_cache_count=prompt_cache_count,
+        )
+
+    def reader(self, tools):
+        reader = self.text_sm.reader(state=self.initial_state)
+        if tools and self.tool_parser is minicpm5.parse_tool_call:
+            return minicpm5.MiniCPM5Reader(reader, tools)
+        return reader
 
     def stop(self):
         self._should_stop = True
@@ -662,7 +686,11 @@ class ResponseGenerator:
                 urls = process_message_content(
                     messages, keep_images=processor is not None
                 )
-                if tools and not tokenizer.has_tool_calling:
+                if (
+                    tools
+                    and not tokenizer.has_tool_calling
+                    and not getattr(self.cli_args, "tool_call_parser", None)
+                ):
                     logging.warning(
                         "Received tools but model does not support tool calling. "
                         "If you think this is an error, file an issue here: "
@@ -840,13 +868,6 @@ class ResponseGenerator:
                         continue
 
                     stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-                    text_sm = TextStateMachine.from_tokenizer(
-                        current_tokenizer,
-                        include_tool_calls=not _use_minicpm5_xml4(
-                            request, self.cli_args
-                        ),
-                    )
-
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
@@ -861,14 +882,12 @@ class ResponseGenerator:
                             segments[0] = segments[0][N:]
                             break
 
-                    ctx = GenerationContext(
-                        has_tool_calling=current_tokenizer.has_tool_calling,
-                        has_thinking=current_tokenizer.has_thinking,
-                        tool_parser=current_tokenizer.tool_parser,
-                        text_sm=text_sm,
-                        initial_state=initial_state,
-                        prompt=prompt,
-                        prompt_cache_count=prompt_cache_count,
+                    ctx = GenerationContext.from_tokenizer(
+                        current_tokenizer,
+                        self.cli_args,
+                        initial_state,
+                        prompt,
+                        prompt_cache_count,
                     )
                     rqueue.put(ctx)
 
@@ -1072,19 +1091,10 @@ class ResponseGenerator:
                 tokenizer, request, args
             )
             stop_sm = TextStateMachine.from_stop_words(args.stop_words)
-            text_sm = TextStateMachine.from_tokenizer(
-                tokenizer,
-                include_tool_calls=not _use_minicpm5_xml4(request, self.cli_args),
-            )
 
             # Start the generation context
-            ctx = GenerationContext(
-                has_thinking=tokenizer.has_thinking,
-                has_tool_calling=tokenizer.has_tool_calling,
-                tool_parser=tokenizer.tool_parser,
-                text_sm=text_sm,
-                initial_state=initial_state,
-                prompt=prompt,
+            ctx = GenerationContext.from_tokenizer(
+                tokenizer, self.cli_args, initial_state, prompt
             )
             rqueue.put(ctx)
 
@@ -1625,14 +1635,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
         # Initialize the text state machine
-        reader = ctx.text_sm.reader(state=ctx.initial_state)
-        if _use_minicpm5_xml4(request, self.response_generator.cli_args):
-            from .tool_parsers.minicpm5_xml4 import XML4Reader
-
-            reader = XML4Reader(reader, request.tools)
-            tool_formatter = ToolCallFormatter(
-                lambda call, _: call, request.tools, self.stream
-            )
+        reader = ctx.reader(request.tools)
 
         # Variables to save the generated text, tokens, logprobs, tools etc
         finish_reason = "stop"
@@ -2029,7 +2032,7 @@ def main():
     parser.add_argument(
         "--tool-call-parser",
         choices=["minicpm5"],
-        help="Use the MiniCPM5 XML4 tool parser.",
+        help="Override the tool parser inferred from the tokenizer.",
     )
     parser.add_argument(
         "--chat-template-args",
